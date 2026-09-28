@@ -217,7 +217,7 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
     if ([self lidSleepDisabled]) [self setLidSleepDisabled:NO];
 }
 
-/// Scriptable: open insomnia://on|off|toggle|lid-on|lid-off
+/// Scriptable: open insomnia://on|off|toggle|lid-on|lid-off|login-on|login-off|quit
 - (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
     for (NSURL *u in urls) {
         NSString *cmd = u.host.lowercaseString ?: @"";
@@ -226,6 +226,11 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
         else if ([cmd isEqualToString:@"toggle"])  [self apply:!self.isAwake];
         else if ([cmd isEqualToString:@"lid-on"])  [self enableLid:NO];
         else if ([cmd isEqualToString:@"lid-off"]) { self.lidPref = NO; [self syncLid]; }
+        else if ([cmd isEqualToString:@"login-on"] || [cmd isEqualToString:@"login-off"]) {
+            BOOL want = [cmd isEqualToString:@"login-on"];
+            if ((SMAppService.mainAppService.status == SMAppServiceStatusEnabled) != want) [self toggleLaunchAtLogin];
+        }
+        else if ([cmd isEqualToString:@"quit"])    [NSApp terminate:nil];
     }
 }
 
