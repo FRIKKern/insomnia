@@ -1,6 +1,7 @@
 // Insomnia — a menu bar toggle that keeps your Mac awake.
 // Left-click the moon to toggle. Right-click for options.
 #import <Cocoa/Cocoa.h>
+#import <IOKit/IOKitLib.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
@@ -11,6 +12,7 @@ static NSString *const kLidKey        = @"insomnia.lid";
 static NSString *const kThresholdKey  = @"insomnia.lid.minBattery";    // percent, default 20
 static NSString *const kGraceKey      = @"insomnia.lid.graceMinutes";  // minutes, 0 = never, default 120
 static NSString *const kUnpluggedKey  = @"insomnia.unpluggedAt";
+static NSString *const kThermalKey    = @"insomnia.lid.thermalGuard";  // default YES
 static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
 
 #pragma mark - Icons
@@ -94,13 +96,38 @@ static NSString *FormatDuration(NSTimeInterval s) {
                   : [NSString stringWithFormat:@"%d h %02d min", m / 60, m % 60];
 }
 
+
+/// Kernel clamshell flag. Test hook: `insomnia.debug.lid` = closed | open.
+static BOOL LidClosed(void) {
+    NSString *fake = [NSUserDefaults.standardUserDefaults stringForKey:@"insomnia.debug.lid"];
+    if (fake.length) return [fake isEqualToString:@"closed"];
+    io_service_t rd = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    if (!rd) return NO;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(rd, CFSTR("AppleClamshellState"), kCFAllocatorDefault, 0);
+    IOObjectRelease(rd);
+    BOOL closed = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+    if (v) CFRelease(v);
+    return closed;
+}
+
+static NSString *const kThermalNames[] = { @"nominal", @"fair", @"serious", @"critical" };
+
+/// System thermal pressure, the signal macOS itself throttles on.
+/// Test hook: `insomnia.debug.thermal` = nominal | fair | serious | critical.
+static NSProcessInfoThermalState Thermal(void) {
+    NSString *fake = [NSUserDefaults.standardUserDefaults stringForKey:@"insomnia.debug.thermal"];
+    for (int i = 0; fake.length && i < 4; i++) if ([fake isEqualToString:kThermalNames[i]]) return i;
+    return NSProcessInfo.processInfo.thermalState;
+}
+
 #pragma mark - App
 
 @interface Insomnia : NSObject <NSApplicationDelegate>
 @property (strong) NSStatusItem *statusItem;
 @property (strong) NSImage *awakeIcon, *awakeLidIcon, *asleepIcon;
 @property (strong) NSTimer *guardTimer;
-@property BOOL lidLive;   // what pmset reported at the last sync
+@property BOOL lidLive;        // what pmset reported at the last sync
+@property BOOL thermalHold;    // tripped hot with lid closed; held until lid opens or AC returns
 - (void)syncLid;
 @end
 
@@ -123,6 +150,8 @@ static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
 
 - (int)minBattery { id v = [self.d objectForKey:kThresholdKey]; return v ? [v intValue] : 20; }
 - (int)graceMinutes { id v = [self.d objectForKey:kGraceKey]; return v ? [v intValue] : 120; }
+- (BOOL)thermalGuard { id v = [self.d objectForKey:kThermalKey]; return v ? [v boolValue] : YES; }
+- (void)toggleThermalGuard { [self.d setBool:!self.thermalGuard forKey:kThermalKey]; [self syncLid]; }
 
 - (NSDate *)unpluggedAt { return [self.d objectForKey:kUnpluggedKey]; }
 - (void)setUnpluggedAt:(NSDate *)date {
@@ -146,6 +175,8 @@ static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
     if (src) { CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode); CFRelease(src); }
     self.guardTimer = [NSTimer scheduledTimerWithTimeInterval:60 target:self selector:@selector(syncLid) userInfo:nil repeats:YES];
     self.guardTimer.tolerance = 10;
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(syncLid)
+        name:NSProcessInfoThermalStateDidChangeNotification object:nil];
 
     [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
 }
@@ -228,6 +259,8 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     NSString *status = onAC ? @"On charger"
                             : [NSString stringWithFormat:@"Unplugged %@ · battery %d%%",
                                FormatDuration(-[self.unpluggedAt timeIntervalSinceNow]), pct];
+    status = [status stringByAppendingFormat:@" · lid %@ · thermal %@",
+              LidClosed() ? @"closed" : @"open", kThermalNames[Thermal()]];
     Item(sub, status, NULL, nil, NO).enabled = NO;
     [sub addItem:NSMenuItem.separatorItem];
     Item(sub, @"Pause lid override when battery is below…", NULL, nil, NO).enabled = NO;
@@ -238,6 +271,8 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     NSArray *graces = @[@[@30, @"30 min"], @[@60, @"1 hour"], @[@120, @"2 hours"], @[@240, @"4 hours"], @[@0, @"Never"]];
     for (NSArray *g in graces)
         Item(sub, g[1], @selector(setGrace:), self, self.graceMinutes == [g[0] intValue]).tag = [g[0] intValue];
+    [sub addItem:NSMenuItem.separatorItem];
+    Item(sub, @"…or when hot with the lid closed", @selector(toggleThermalGuard), self, self.thermalGuard);
     NSMenuItem *subItem = [[NSMenuItem alloc] initWithTitle:@"Lid Override on Battery" action:nil keyEquivalent:@""];
     subItem.submenu = sub;
     [menu addItem:subItem];
@@ -296,6 +331,8 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     NSTimeInterval unplugged = -[self.unpluggedAt timeIntervalSinceNow];
     if (self.graceMinutes > 0 && unplugged > self.graceMinutes * 60)
         return [NSString stringWithFormat:@"unplugged %@", FormatDuration(unplugged)];
+    if (self.thermalHold)
+        return [NSString stringWithFormat:@"%@ with lid closed", kThermalNames[Thermal()]];
     return nil;
 }
 
@@ -305,6 +342,12 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     BOOL onAC; int pct; PowerState(&onAC, &pct);
     if (onAC) self.unpluggedAt = nil;
     else if (!self.unpluggedAt) self.unpluggedAt = NSDate.date;
+
+    // Bag guard: hot while shut on battery trips a hold that only lid-open or AC clears,
+    // so a cooling-then-reheating laptop cannot oscillate.
+    BOOL closed = LidClosed();
+    if (onAC || !closed || !self.thermalGuard) self.thermalHold = NO;
+    else if (Thermal() >= NSProcessInfoThermalStateSerious) self.thermalHold = YES;
 
     BOOL want = self.isAwake && self.lidPref && ![self pauseReason];
     BOOL have = [self lidSleepDisabled];
@@ -352,8 +395,8 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
         NSAlert *a = [NSAlert new];
         a.messageText = @"Keep the Mac awake with the lid closed?";
         a.informativeText = @"It will keep running with the lid shut, also inside a bag, and can get warm.\n\n"
-                             "On battery, Insomnia pauses this when the battery gets low or the charger has been "
-                             "out for a while (adjustable). It also turns it off when you switch Insomnia off or quit. "
+                             "On battery, Insomnia pauses this when the battery gets low, the charger has been "
+                             "out for a while, or the Mac runs hot with the lid shut (adjustable). It also turns it off when you switch Insomnia off or quit. "
                              "The first time, macOS asks for your password to allow the change.";
         [a addButtonWithTitle:@"Keep Awake"];
         [a addButtonWithTitle:@"Cancel"];

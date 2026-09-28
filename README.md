@@ -64,13 +64,19 @@ Unplugging does not pause the override straight away, so moving rooms or working
 | battery at or below | 20% | 10, 20, 30, 40, 50 |
 | unplugged longer than | 2 hours | 30 min, 1 h, 2 h, 4 h, never |
 
-The unplugged clock is persisted, so a relaunch on battery does not reset it. The submenu *Lid Override on Battery* shows the current state, for example "Unplugged 42 min · battery 63%". Plain idle-sleep prevention is not affected by the guard.
+The unplugged clock is persisted, so a relaunch on battery does not reset it. The submenu *Lid Override on Battery* shows the current state, for example "Unplugged 42 min · battery 63% · lid closed · thermal nominal". Plain idle-sleep prevention is not affected by the guard.
 
-Test hook for simulating power states without unplugging:
+### Bag guard
+
+The dangerous case is a laptop running shut inside a bag. Insomnia watches the system thermal state, the same nominal / fair / serious / critical signal macOS throttles on, and the kernel's clamshell flag. On battery, with the lid closed, at *serious* or worse, the override pauses so the Mac can sleep and cool. That pause is **held** until the lid opens or the charger returns, so a laptop that cools and reheats cannot oscillate. Thermal changes trigger a check immediately. Toggle in the submenu: *…or when hot with the lid closed* (default on).
+
+Test hooks for simulating states without unplugging or heating anything:
 
 ```
-defaults write no.guerrilla.insomnia insomnia.debug.power battery:15   # or: ac
-defaults delete no.guerrilla.insomnia insomnia.debug.power            # back to real readings
+defaults write no.guerrilla.insomnia insomnia.debug.power   battery:15   # or: ac
+defaults write no.guerrilla.insomnia insomnia.debug.lid     closed       # or: open
+defaults write no.guerrilla.insomnia insomnia.debug.thermal serious      # nominal | fair | serious | critical
+defaults delete no.guerrilla.insomnia insomnia.debug.power              # back to real readings, same for lid/thermal
 ```
 
 Running with the lid shut inside a bag makes the machine warm. Remove the rule with `sudo rm /etc/sudoers.d/insomnia`.
