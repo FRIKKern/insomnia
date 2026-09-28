@@ -3,6 +3,7 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/pwr_mgt/IOPM.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <ServiceManagement/ServiceManagement.h>
@@ -15,6 +16,7 @@ static NSString *const kThresholdKey  = @"insomnia.lid.minBattery";    // percen
 static NSString *const kGraceKey      = @"insomnia.lid.graceMinutes";  // minutes, 0 = never, default 120
 static NSString *const kUnpluggedKey  = @"insomnia.unpluggedAt";
 static NSString *const kThermalKey    = @"insomnia.lid.thermalGuard";  // default YES
+static NSString *const kScreenOffKey  = @"insomnia.lid.screenOff";     // default YES
 static NSString *const kOfflineKey    = @"insomnia.lid.offlineMinutes"; // minutes, 0 = ignore network, default 15
 static NSString *const kOfflineAtKey  = @"insomnia.offlineAt";
 static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
@@ -150,11 +152,15 @@ static BOOL Online(void) {
 @property BOOL thermalHold;    // tripped hot with lid closed; held until lid opens or AC returns
 @property SCNetworkReachabilityRef reach;
 @property (strong) NSString *availableVersion;   // newer release seen by the last check, or nil
+@property BOOL screenDarkened;                    // we put the display to sleep for this lid-closed stretch
 - (void)syncLid;
 @end
 
 static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
 static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f, void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
+static void RootDomainMessage(void *ctx, io_service_t s, natural_t type, void *arg) {
+    if (type == kIOPMMessageClamshellStateChange) [(__bridge Insomnia *)ctx syncLid];
+}
 
 @implementation Insomnia {
     IOPMAssertionID _assertions[2];
@@ -175,6 +181,8 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
 - (int)graceMinutes { id v = [self.d objectForKey:kGraceKey]; return v ? [v intValue] : 120; }
 - (BOOL)thermalGuard { id v = [self.d objectForKey:kThermalKey]; return v ? [v boolValue] : YES; }
 - (void)toggleThermalGuard { [self.d setBool:!self.thermalGuard forKey:kThermalKey]; [self syncLid]; }
+- (BOOL)screenOff { id v = [self.d objectForKey:kScreenOffKey]; return v ? [v boolValue] : YES; }
+- (void)toggleScreenOff { [self.d setBool:!self.screenOff forKey:kScreenOffKey]; [self syncLid]; }
 - (BOOL)autoUpdate { id v = [self.d objectForKey:kAutoUpdateKey]; return v ? [v boolValue] : YES; }
 - (void)toggleAutoUpdate { [self.d setBool:!self.autoUpdate forKey:kAutoUpdateKey]; }
 - (NSString *)version { return NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"0"; }
@@ -214,6 +222,14 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
     SCNetworkReachabilityContext ctx = { 0, (__bridge void *)self, NULL, NULL, NULL };
     if (self.reach && SCNetworkReachabilitySetCallback(self.reach, NetChanged, &ctx))
         SCNetworkReachabilityScheduleWithRunLoop(self.reach, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    // Lid open/close: the power root posts kIOPMMessageClamshellStateChange.
+    IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
+    io_service_t rd = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    io_object_t notifier = 0;
+    if (port && rd && IOServiceAddInterestNotification(port, rd, kIOGeneralInterest, RootDomainMessage,
+                                                       (__bridge void *)self, &notifier) == KERN_SUCCESS)
+        CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
+    if (rd) IOObjectRelease(rd);
 
     [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
     [self performSelector:@selector(dailyUpdateCheck) withObject:nil afterDelay:20];
@@ -297,6 +313,7 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
 
     Item(menu, @"Prevent Sleep", @selector(toggle), self, awake);
     Item(menu, @"Keep Awake With Lid Closed", @selector(toggleLid), self, lid);
+    Item(menu, @"Screen Off While Lid Closed", @selector(toggleScreenOff), self, self.screenOff).enabled = lid;
 
     // On-battery guard submenu
     NSMenu *sub = [NSMenu new];
@@ -490,6 +507,17 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     if (want != have && [self setLidSleepDisabled:want]) have = want;
     self.lidLive = have;
     [self refreshIcon];
+
+    // Shut and kept awake: the panel would otherwise stay lit until the display-sleep timer,
+    // or forever if something holds a display assertion. Sleep it now; lid-open wakes it.
+    if (!closed) self.screenDarkened = NO;
+    else if (have && self.screenOff && !self.screenDarkened) { [self sleepDisplay]; self.screenDarkened = YES; }
+}
+
+/// `pmset displaysleepnow` goes through powerd and works for a normal user;
+/// writing IORequestIdle to the power root directly is refused without root.
+- (void)sleepDisplay {
+    Run(@"/usr/bin/pmset", @[@"displaysleepnow"], NULL);
 }
 
 - (BOOL)lidSleepDisabled {

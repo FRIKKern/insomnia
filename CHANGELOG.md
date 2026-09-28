@@ -2,6 +2,12 @@
 
 All notable changes to Insomnia. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0] - 2026-09-28
+
+### Added
+- *Screen Off While Lid Closed* (default on): sleeps the display the moment the lid closes while the override is live, even when an app holds a display assertion. Lid open wakes it.
+- Lid open/close now triggers an immediate guard check via the kernel clamshell notification, instead of waiting for the next power event or minute tick.
+
 ## [1.1.0] - 2026-09-28
 
 ### Added

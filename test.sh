@@ -20,7 +20,7 @@ orig_awake=$(defaults read $D insomnia.awake 2>/dev/null || echo 1)
 orig_lid=$(defaults read $D insomnia.lid 2>/dev/null || echo 0)
 cleanup() {
   for k in power lid thermal net; do defaults delete $D insomnia.debug.$k >/dev/null 2>&1; done
-  for k in lid.minBattery lid.graceMinutes lid.offlineMinutes lid.thermalGuard unpluggedAt offlineAt; do defaults delete $D insomnia.$k >/dev/null 2>&1; done
+  for k in lid.minBattery lid.graceMinutes lid.offlineMinutes lid.thermalGuard lid.screenOff unpluggedAt offlineAt; do defaults delete $D insomnia.$k >/dev/null 2>&1; done
   [ "$orig_lid" = "1" ] && defaults write $D insomnia.lid -bool true || defaults write $D insomnia.lid -bool false
   [ "$orig_awake" = "1" ] && open insomnia://on || open insomnia://off
 }
@@ -58,6 +58,14 @@ if sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
   dbg power=ac;                                        check "AC clears hold" live "$(lid)"
   dbg power=battery:70 lid=closed thermal=serious; defaults write $D insomnia.lid.thermalGuard -bool false; sync
                                                        check "thermal guard disabled" live "$(lid)"
+  echo "== screen off while lid closed (screen goes dark for a few seconds)"
+  offs() { pmset -g log | grep -cE "Display is turned off"; }
+  dbg power=ac lid=open thermal=nominal net=online; sleep 1
+  b=$(offs); dbg lid=closed; sleep 2;                  check "lid closed + override live sleeps display" yes "$( [ $(offs) -gt $b ] && echo yes || echo no)"
+  dbg lid=open; caffeinate -u -t 2; sleep 1
+  defaults write $D insomnia.lid.screenOff -bool false; b=$(offs); dbg lid=closed; sleep 2
+                                                       check "option off leaves display alone" yes "$( [ $(offs) -eq $b ] && echo yes || echo no)"
+  defaults delete $D insomnia.lid.screenOff; dbg lid=open; caffeinate -u -t 1
   echo "== self-heal"
   defaults write $D insomnia.lid -bool false; sudo -n /usr/bin/pmset -a disablesleep 1
   open insomnia://quit; sleep 1.5; open ~/Applications/Insomnia.app; sleep 2.5

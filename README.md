@@ -56,7 +56,7 @@ Removes the app, preferences, login item, and the optional sudo rule. Restores n
 ## Use
 
 - **Left-click** the moon: toggle.
-- **Right-click** (or ctrl-click): menu with *Prevent Sleep*, *Keep Awake With Lid Closed*, *Lid Override on Battery*, *Launch at Login*, *Quit*.
+- **Right-click** (or ctrl-click): menu with *Prevent Sleep*, *Keep Awake With Lid Closed*, *Screen Off While Lid Closed*, *Lid Override on Battery*, *Launch at Login*, *Quit*.
 - The display may still dim and turn off. That is intended: it saves battery while the system, network and your terminal sessions keep running.
 - State is remembered across restarts. Default on first launch is **on**.
 
@@ -106,6 +106,8 @@ The lid override (`INSOMNIA_LID=1` or `open insomnia://lid-on`) triggers a macOS
 ```
 
 After that the toggle is silent. The override is active only while Insomnia is **on**, the lid setting is **on**, and no guard is pausing it. Switching Insomnia off, or quitting, clears it, so the laptop sleeps normally on lid close again. On every launch Insomnia compares the OS setting with its own preferences and repairs it, so a crash or forced kill is healed at the next start.
+
+**Screen Off While Lid Closed** (default on): a shut MacBook kept awake would otherwise leave its panel lit until the display-sleep timer, or indefinitely if a browser or media app holds a display assertion. The moment the lid closes with the override live, Insomnia asks macOS to sleep the display, the same as `pmset displaysleepnow`. Opening the lid counts as user activity and wakes it, so brightness is never touched and nothing needs restoring.
 
 Running with the lid shut inside a bag makes the machine warm. The guards below exist for that. Remove the rule any time with `sudo rm /etc/sudoers.d/insomnia`.
 
