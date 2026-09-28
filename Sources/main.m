@@ -18,6 +18,9 @@ static NSString *const kThermalKey    = @"insomnia.lid.thermalGuard";  // defaul
 static NSString *const kOfflineKey    = @"insomnia.lid.offlineMinutes"; // minutes, 0 = ignore network, default 15
 static NSString *const kOfflineAtKey  = @"insomnia.offlineAt";
 static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
+static NSString *const kAutoUpdateKey = @"insomnia.autoUpdateCheck";   // default YES
+static NSString *const kUpdateAtKey   = @"insomnia.updateCheckedAt";
+static NSString *const kRepo          = @"FRIKKern/insomnia";
 
 #pragma mark - Icons
 
@@ -146,6 +149,7 @@ static BOOL Online(void) {
 @property BOOL lidLive;        // what pmset reported at the last sync
 @property BOOL thermalHold;    // tripped hot with lid closed; held until lid opens or AC returns
 @property SCNetworkReachabilityRef reach;
+@property (strong) NSString *availableVersion;   // newer release seen by the last check, or nil
 - (void)syncLid;
 @end
 
@@ -171,6 +175,9 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
 - (int)graceMinutes { id v = [self.d objectForKey:kGraceKey]; return v ? [v intValue] : 120; }
 - (BOOL)thermalGuard { id v = [self.d objectForKey:kThermalKey]; return v ? [v boolValue] : YES; }
 - (void)toggleThermalGuard { [self.d setBool:!self.thermalGuard forKey:kThermalKey]; [self syncLid]; }
+- (BOOL)autoUpdate { id v = [self.d objectForKey:kAutoUpdateKey]; return v ? [v boolValue] : YES; }
+- (void)toggleAutoUpdate { [self.d setBool:!self.autoUpdate forKey:kAutoUpdateKey]; }
+- (NSString *)version { return NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"0"; }
 - (int)offlineMinutes { id v = [self.d objectForKey:kOfflineKey]; return v ? [v intValue] : 15; }
 - (void)setOffline:(NSMenuItem *)item { [self.d setInteger:item.tag forKey:kOfflineKey]; [self syncLid]; }
 - (NSDate *)offlineAt { return [self.d objectForKey:kOfflineAtKey]; }
@@ -209,6 +216,7 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
         SCNetworkReachabilityScheduleWithRunLoop(self.reach, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
 
     [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
+    [self performSelector:@selector(dailyUpdateCheck) withObject:nil afterDelay:20];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
@@ -231,6 +239,7 @@ static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f,
             if ((SMAppService.mainAppService.status == SMAppServiceStatusEnabled) != want) [self toggleLaunchAtLogin];
         }
         else if ([cmd isEqualToString:@"quit"])    [NSApp terminate:nil];
+        else if ([cmd isEqualToString:@"update"])  [self checkForUpdates:YES];
     }
 }
 
@@ -322,6 +331,15 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     Item(menu, @"Launch at Login", @selector(toggleLaunchAtLogin), self,
          SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
     [menu addItem:NSMenuItem.separatorItem];
+    NSMenu *upd = [NSMenu new];
+    Item(upd, [NSString stringWithFormat:@"Insomnia %@", self.version], NULL, nil, NO).enabled = NO;
+    Item(upd, self.availableVersion ? [NSString stringWithFormat:@"Update to %@…", self.availableVersion] : @"Check for Updates…",
+         @selector(checkNow), self, NO);
+    Item(upd, @"Check Daily", @selector(toggleAutoUpdate), self, self.autoUpdate);
+    NSMenuItem *updItem = [[NSMenuItem alloc] initWithTitle:self.availableVersion ? [NSString stringWithFormat:@"Update Available: %@", self.availableVersion] : @"Updates"
+                                                     action:nil keyEquivalent:@""];
+    updItem.submenu = upd;
+    [menu addItem:updItem];
     Item(menu, @"Quit Insomnia", @selector(quit), self, NO).keyEquivalent = @"q";
 
     self.statusItem.menu = menu;
@@ -360,6 +378,78 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
 - (void)releaseAssertions {
     for (int i = 0; i < _assertionCount; i++) IOPMAssertionRelease(_assertions[i]);
     _assertionCount = 0;
+}
+
+#pragma mark Updates
+
+- (void)checkNow { [self checkForUpdates:YES]; }
+
+/// Once a day, quietly. Only marks the menu; never interrupts.
+- (void)dailyUpdateCheck {
+    if (!self.autoUpdate) return;
+    NSDate *last = [self.d objectForKey:kUpdateAtKey];
+    if (!last || -[last timeIntervalSinceNow] > 24 * 3600) [self checkForUpdates:NO];
+}
+
+- (void)checkForUpdates:(BOOL)interactive {
+    NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"https://api.github.com/repos/%@/releases/latest", kRepo]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    [req setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
+    req.timeoutInterval = 15;
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *r, NSError *err) {
+        NSString *tag = nil;
+        if (data) {
+            id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([j isKindOfClass:NSDictionary.class] && [j[@"tag_name"] isKindOfClass:NSString.class]) tag = j[@"tag_name"];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ [self handleUpdateTag:tag interactive:interactive error:err]; });
+    }] resume];
+}
+
+- (void)handleUpdateTag:(NSString *)tag interactive:(BOOL)interactive error:(NSError *)err {
+    [self.d setObject:NSDate.date forKey:kUpdateAtKey];
+    NSString *latest = [tag hasPrefix:@"v"] ? [tag substringFromIndex:1] : tag;
+    BOOL newer = latest && [latest compare:self.version options:NSNumericSearch] == NSOrderedDescending;
+    self.availableVersion = newer ? latest : nil;
+    // Also readable by scripts: defaults read no.guerrilla.insomnia insomnia.availableVersion
+    if (newer) [self.d setObject:latest forKey:@"insomnia.availableVersion"];
+    else [self.d removeObjectForKey:@"insomnia.availableVersion"];
+    if (!interactive) return;
+
+    NSAlert *a = [NSAlert new];
+    if (!latest) {
+        a.messageText = @"Couldn't check for updates";
+        a.informativeText = err.localizedDescription ?: @"No answer from GitHub.";
+        [a addButtonWithTitle:@"OK"];
+    } else if (!newer) {
+        a.messageText = [NSString stringWithFormat:@"Insomnia %@ is up to date", self.version];
+        [a addButtonWithTitle:@"OK"];
+    } else {
+        a.messageText = [NSString stringWithFormat:@"Insomnia %@ is available", latest];
+        a.informativeText = [NSString stringWithFormat:@"You have %@. Update builds the new version from source on this Mac "
+                             "and relaunches Insomnia. It takes a few seconds and needs no password.", self.version];
+        [a addButtonWithTitle:@"Update"];
+        [a addButtonWithTitle:@"Release Notes"];
+        [a addButtonWithTitle:@"Later"];
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+    NSModalResponse resp = [a runModal];
+    if (!newer) return;
+    if (resp == NSAlertFirstButtonReturn) [self runUpdate:tag];
+    else if (resp == NSAlertSecondButtonReturn)
+        [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://github.com/%@/releases/latest", kRepo]]];
+}
+
+/// Runs the public installer, detached: it quits this app and relaunches the new build.
+- (void)runUpdate:(NSString *)tag {
+    NSString *cmd = [NSString stringWithFormat:
+        @"nohup /bin/sh -c 'sleep 1; curl -fsSL https://raw.githubusercontent.com/%@/main/install.sh | INSOMNIA_REF=%@ sh' >/dev/null 2>&1 &",
+        kRepo, tag];
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    t.arguments = @[@"-c", cmd];
+    t.currentDirectoryURL = [NSURL fileURLWithPath:NSTemporaryDirectory()];
+    [t launchAndReturnError:nil];
 }
 
 #pragma mark Lid (pmset disablesleep, root-only)

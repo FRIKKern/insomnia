@@ -72,6 +72,7 @@ open insomnia://lid-on        # enable Keep Awake With Lid Closed, no confirmati
 open insomnia://lid-off
 open insomnia://login-on      # register Launch at Login
 open insomnia://login-off
+open insomnia://update        # check for updates (shows a dialog)
 open insomnia://quit          # clean quit, restores normal lid sleep
 ```
 
@@ -133,6 +134,10 @@ defaults write no.guerrilla.insomnia insomnia.debug.net     offline      # or: o
 defaults delete no.guerrilla.insomnia insomnia.debug.power              # back to real readings; same for the others
 ```
 
+## Updates
+
+The *Updates* submenu shows your version and *Check for Updates…*. Once a day Insomnia quietly asks GitHub for the latest release and, if there is one, the menu shows *Update to X.Y.Z…*. Choosing it runs the same installer as above: builds the new version from source on your Mac and relaunches. No password, no Gatekeeper prompt. Turn the daily check off with *Check Daily*. Scripts can trigger a check with `open insomnia://update` and read `defaults read no.guerrilla.insomnia insomnia.availableVersion`.
+
 ## How it works
 
 Insomnia holds the same two IOKit power assertions as `caffeinate -i -s`: `PreventUserIdleSystemSleep` always, and `PreventSystemSleep`, which macOS honours on AC only. It is one Objective-C file with no dependencies, so it builds with clang from the Command Line Tools alone. No Xcode, no Swift toolchain, no package manager.
@@ -144,6 +149,20 @@ git clone https://github.com/FRIKKern/insomnia.git && cd insomnia
 ./build.sh                 # universal build, installs to ~/Applications
 ./build.sh --no-install    # just build into build/Insomnia.app
 ```
+
+Run the guard matrix against the running app (uses the debug hooks, needs the sudo rule for the lid tests):
+
+```sh
+./test.sh
+```
+
+Cut a release (bumps the version, tags, pushes; CI attaches the zip and the tap updates itself):
+
+```sh
+./release.sh 1.2.0
+```
+
+See [CHANGELOG.md](CHANGELOG.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and, for AI agents, [AGENTS.md](AGENTS.md).
 
 Regenerate the app icon (only if you change `tools/mkicon.m`):
 
