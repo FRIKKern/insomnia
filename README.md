@@ -64,7 +64,17 @@ Unplugging does not pause the override straight away, so moving rooms or working
 | battery at or below | 20% | 10, 20, 30, 40, 50 |
 | unplugged longer than | 2 hours | 30 min, 1 h, 2 h, 4 h, never |
 
-The unplugged clock is persisted, so a relaunch on battery does not reset it. The submenu *Lid Override on Battery* shows the current state, for example "Unplugged 42 min · battery 63% · lid closed · thermal nominal". Plain idle-sleep prevention is not affected by the guard.
+The unplugged clock is persisted, so a relaunch on battery does not reset it. The submenu *Lid Override on Battery* shows the current state, for example "Unplugged 42 min · battery 63% · lid closed · thermal nominal · offline 3 min". Plain idle-sleep prevention is not affected by the guard.
+
+### Network guard
+
+Agents need a network. If the Mac has been offline longer than a grace period, the override pauses and the Mac may sleep. Connectivity is read from the system reachability API, which covers Wi-Fi, Ethernet and tethering, and changes trigger an immediate check. The offline clock is persisted like the unplugged clock. Battery only, like the other guards.
+
+| Limit | Default | Menu options |
+|-------|---------|--------------|
+| offline longer than | 15 min | 5, 15, 30 min, 1 h, **Never** |
+
+Pick *Never* when you want a render or a build to finish while moving with no network.
 
 ### Bag guard
 
@@ -76,6 +86,7 @@ Test hooks for simulating states without unplugging or heating anything:
 defaults write no.guerrilla.insomnia insomnia.debug.power   battery:15   # or: ac
 defaults write no.guerrilla.insomnia insomnia.debug.lid     closed       # or: open
 defaults write no.guerrilla.insomnia insomnia.debug.thermal serious      # nominal | fair | serious | critical
+defaults write no.guerrilla.insomnia insomnia.debug.net     offline      # or: online
 defaults delete no.guerrilla.insomnia insomnia.debug.power              # back to real readings, same for lid/thermal
 ```
 

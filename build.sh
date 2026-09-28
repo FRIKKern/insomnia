@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP=build/Insomnia.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 clang -fobjc-arc -O2 -Wall -mmacosx-version-min=13.0 \
-  -framework Cocoa -framework IOKit -framework ServiceManagement \
+  -framework Cocoa -framework IOKit -framework ServiceManagement -framework SystemConfiguration \
   Sources/main.m -o "$APP/Contents/MacOS/Insomnia"
 cp Info.plist "$APP/Contents/"
 [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/"

@@ -6,6 +6,8 @@
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import <netinet/in.h>
 
 static NSString *const kStateKey      = @"insomnia.awake";
 static NSString *const kLidKey        = @"insomnia.lid";
@@ -13,6 +15,8 @@ static NSString *const kThresholdKey  = @"insomnia.lid.minBattery";    // percen
 static NSString *const kGraceKey      = @"insomnia.lid.graceMinutes";  // minutes, 0 = never, default 120
 static NSString *const kUnpluggedKey  = @"insomnia.unpluggedAt";
 static NSString *const kThermalKey    = @"insomnia.lid.thermalGuard";  // default YES
+static NSString *const kOfflineKey    = @"insomnia.lid.offlineMinutes"; // minutes, 0 = ignore network, default 15
+static NSString *const kOfflineAtKey  = @"insomnia.offlineAt";
 static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
 
 #pragma mark - Icons
@@ -120,6 +124,19 @@ static NSProcessInfoThermalState Thermal(void) {
     return NSProcessInfo.processInfo.thermalState;
 }
 
+/// True when a route to the internet exists (Wi-Fi, Ethernet, tethering).
+/// Test hook: `insomnia.debug.net` = online | offline.
+static BOOL Online(void) {
+    NSString *fake = [NSUserDefaults.standardUserDefaults stringForKey:@"insomnia.debug.net"];
+    if (fake.length) return [fake isEqualToString:@"online"];
+    struct sockaddr_in zero = { .sin_len = sizeof(zero), .sin_family = AF_INET };
+    SCNetworkReachabilityRef r = SCNetworkReachabilityCreateWithAddress(NULL, (struct sockaddr *)&zero);
+    SCNetworkReachabilityFlags f = 0;
+    BOOL ok = r && SCNetworkReachabilityGetFlags(r, &f);
+    if (r) CFRelease(r);
+    return ok && (f & kSCNetworkReachabilityFlagsReachable) && !(f & kSCNetworkReachabilityFlagsConnectionRequired);
+}
+
 #pragma mark - App
 
 @interface Insomnia : NSObject <NSApplicationDelegate>
@@ -128,10 +145,12 @@ static NSProcessInfoThermalState Thermal(void) {
 @property (strong) NSTimer *guardTimer;
 @property BOOL lidLive;        // what pmset reported at the last sync
 @property BOOL thermalHold;    // tripped hot with lid closed; held until lid opens or AC returns
+@property SCNetworkReachabilityRef reach;
 - (void)syncLid;
 @end
 
 static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
+static void NetChanged(SCNetworkReachabilityRef r, SCNetworkReachabilityFlags f, void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
 
 @implementation Insomnia {
     IOPMAssertionID _assertions[2];
@@ -152,6 +171,12 @@ static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
 - (int)graceMinutes { id v = [self.d objectForKey:kGraceKey]; return v ? [v intValue] : 120; }
 - (BOOL)thermalGuard { id v = [self.d objectForKey:kThermalKey]; return v ? [v boolValue] : YES; }
 - (void)toggleThermalGuard { [self.d setBool:!self.thermalGuard forKey:kThermalKey]; [self syncLid]; }
+- (int)offlineMinutes { id v = [self.d objectForKey:kOfflineKey]; return v ? [v intValue] : 15; }
+- (void)setOffline:(NSMenuItem *)item { [self.d setInteger:item.tag forKey:kOfflineKey]; [self syncLid]; }
+- (NSDate *)offlineAt { return [self.d objectForKey:kOfflineAtKey]; }
+- (void)setOfflineAt:(NSDate *)date {
+    if (date) [self.d setObject:date forKey:kOfflineAtKey]; else [self.d removeObjectForKey:kOfflineAtKey];
+}
 
 - (NSDate *)unpluggedAt { return [self.d objectForKey:kUnpluggedKey]; }
 - (void)setUnpluggedAt:(NSDate *)date {
@@ -177,6 +202,11 @@ static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
     self.guardTimer.tolerance = 10;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(syncLid)
         name:NSProcessInfoThermalStateDidChangeNotification object:nil];
+    struct sockaddr_in zero = { .sin_len = sizeof(zero), .sin_family = AF_INET };
+    self.reach = SCNetworkReachabilityCreateWithAddress(NULL, (struct sockaddr *)&zero);
+    SCNetworkReachabilityContext ctx = { 0, (__bridge void *)self, NULL, NULL, NULL };
+    if (self.reach && SCNetworkReachabilitySetCallback(self.reach, NetChanged, &ctx))
+        SCNetworkReachabilityScheduleWithRunLoop(self.reach, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
 
     [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
 }
@@ -259,8 +289,9 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     NSString *status = onAC ? @"On charger"
                             : [NSString stringWithFormat:@"Unplugged %@ · battery %d%%",
                                FormatDuration(-[self.unpluggedAt timeIntervalSinceNow]), pct];
-    status = [status stringByAppendingFormat:@" · lid %@ · thermal %@",
-              LidClosed() ? @"closed" : @"open", kThermalNames[Thermal()]];
+    status = [status stringByAppendingFormat:@" · lid %@ · thermal %@ · %@",
+              LidClosed() ? @"closed" : @"open", kThermalNames[Thermal()],
+              Online() ? @"online" : [NSString stringWithFormat:@"offline %@", FormatDuration(-[self.offlineAt timeIntervalSinceNow])]];
     Item(sub, status, NULL, nil, NO).enabled = NO;
     [sub addItem:NSMenuItem.separatorItem];
     Item(sub, @"Pause lid override when battery is below…", NULL, nil, NO).enabled = NO;
@@ -271,6 +302,11 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     NSArray *graces = @[@[@30, @"30 min"], @[@60, @"1 hour"], @[@120, @"2 hours"], @[@240, @"4 hours"], @[@0, @"Never"]];
     for (NSArray *g in graces)
         Item(sub, g[1], @selector(setGrace:), self, self.graceMinutes == [g[0] intValue]).tag = [g[0] intValue];
+    [sub addItem:NSMenuItem.separatorItem];
+    Item(sub, @"…or when offline longer than (agents need network)", NULL, nil, NO).enabled = NO;
+    NSArray *offs = @[@[@5, @"5 min"], @[@15, @"15 min"], @[@30, @"30 min"], @[@60, @"1 hour"], @[@0, @"Never — keep rendering while moving"]];
+    for (NSArray *o in offs)
+        Item(sub, o[1], @selector(setOffline:), self, self.offlineMinutes == [o[0] intValue]).tag = [o[0] intValue];
     [sub addItem:NSMenuItem.separatorItem];
     Item(sub, @"…or when hot with the lid closed", @selector(toggleThermalGuard), self, self.thermalGuard);
     NSMenuItem *subItem = [[NSMenuItem alloc] initWithTitle:@"Lid Override on Battery" action:nil keyEquivalent:@""];
@@ -333,6 +369,9 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
         return [NSString stringWithFormat:@"unplugged %@", FormatDuration(unplugged)];
     if (self.thermalHold)
         return [NSString stringWithFormat:@"%@ with lid closed", kThermalNames[Thermal()]];
+    NSTimeInterval offline = self.offlineAt ? -[self.offlineAt timeIntervalSinceNow] : 0;
+    if (self.offlineMinutes > 0 && self.offlineAt && offline > self.offlineMinutes * 60)
+        return [NSString stringWithFormat:@"offline %@", FormatDuration(offline)];
     return nil;
 }
 
@@ -342,6 +381,8 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     BOOL onAC; int pct; PowerState(&onAC, &pct);
     if (onAC) self.unpluggedAt = nil;
     else if (!self.unpluggedAt) self.unpluggedAt = NSDate.date;
+    if (Online()) self.offlineAt = nil;
+    else if (!self.offlineAt) self.offlineAt = NSDate.date;
 
     // Bag guard: hot while shut on battery trips a hold that only lid-open or AC clears,
     // so a cooling-then-reheating laptop cannot oscillate.
