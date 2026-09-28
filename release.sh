@@ -9,6 +9,10 @@ V="${1:-}"; case "$V" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "usage: ./release.sh X
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean" >&2; exit 1; }
 git pull -q --ff-only
 grep -q "^## \[$V\]" CHANGELOG.md || { echo "CHANGELOG.md has no '## [$V]' section" >&2; exit 1; }
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  sh build.sh >/dev/null && { open insomnia://quit; sleep 1; open ~/Applications/Insomnia.app; sleep 2; }
+  ./test.sh || { echo "test.sh failed; not releasing (SKIP_TESTS=1 to override)" >&2; exit 1; }
+fi
 BUILD=$(echo "$V" | awk -F. '{printf "%d%02d%02d", $1, $2, $3}')
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $V" -c "Set :CFBundleVersion $BUILD" Info.plist
 sh build.sh --no-install >/dev/null

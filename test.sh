@@ -60,7 +60,7 @@ if sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
                                                        check "thermal guard disabled" live "$(lid)"
   echo "== screen off while lid closed (screen goes dark for a few seconds)"
   offs() { pmset -g log | grep -cE "Display is turned off"; }
-  dbg power=ac lid=open thermal=nominal net=online; sleep 1
+  dbg power=ac lid=open thermal=nominal net=online; caffeinate -u -t 2; sleep 2   # wake display first
   b=$(offs); dbg lid=closed; sleep 2;                  check "lid closed + override live sleeps display" yes "$( [ $(offs) -gt $b ] && echo yes || echo no)"
   dbg lid=open; caffeinate -u -t 2; sleep 1
   defaults write $D insomnia.lid.screenOff -bool false; b=$(offs); dbg lid=closed; sleep 2
