@@ -5,6 +5,7 @@ A tiny macOS menu bar app that keeps your laptop awake. One click to toggle.
 | Icon | Meaning |
 |------|---------|
 | moon with a cross above it | Insomnia is **on**. The Mac will not idle-sleep. |
+| moon, cross, and a dot | On, and the lid override is live right now. |
 | plain moon | Insomnia is **off**. Normal sleep behaviour. |
 
 - **Left-click** the icon: toggle.
@@ -52,7 +53,25 @@ iconutil -c icns build/AppIcon.iconset -o AppIcon.icns
 <you> ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0
 ```
 
-After that the toggle is silent. The override is active only while Insomnia is **on** and the lid setting is **on**. Switching Insomnia off, or quitting, clears it, so the laptop sleeps normally on lid close again. A crash or a forced kill does not clear it; run `sudo pmset -a disablesleep 0` by hand in that case. Check with `pmset -g | grep SleepDisabled`.
+After that the toggle is silent. The override is active only while Insomnia is **on**, the lid setting is **on**, and the battery guard is not pausing it. Switching Insomnia off, or quitting, clears it, so the laptop sleeps normally on lid close again. On every launch Insomnia compares the OS setting with its own preferences and repairs it, so a crash or forced kill is healed at the next start. Check with `pmset -g | grep SleepDisabled`.
+
+### Battery guard
+
+Unplugging does not pause the override straight away, so moving rooms or working an hour on battery keeps working. The override pauses when either limit is hit, and re-arms when the charger returns:
+
+| Limit | Default | Menu options |
+|-------|---------|--------------|
+| battery at or below | 20% | 10, 20, 30, 40, 50 |
+| unplugged longer than | 2 hours | 30 min, 1 h, 2 h, 4 h, never |
+
+The unplugged clock is persisted, so a relaunch on battery does not reset it. The submenu *Lid Override on Battery* shows the current state, for example "Unplugged 42 min · battery 63%". Plain idle-sleep prevention is not affected by the guard.
+
+Test hook for simulating power states without unplugging:
+
+```
+defaults write no.guerrilla.insomnia insomnia.debug.power battery:15   # or: ac
+defaults delete no.guerrilla.insomnia insomnia.debug.power            # back to real readings
+```
 
 Running with the lid shut inside a bag makes the machine warm. Remove the rule with `sudo rm /etc/sudoers.d/insomnia`.
 

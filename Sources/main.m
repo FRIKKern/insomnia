@@ -2,11 +2,16 @@
 // Left-click the moon to toggle. Right-click for options.
 #import <Cocoa/Cocoa.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <ServiceManagement/ServiceManagement.h>
 
-static NSString *const kStateKey   = @"insomnia.awake";
-static NSString *const kLidKey     = @"insomnia.lid";
-static NSString *const kSudoers    = @"/etc/sudoers.d/insomnia";
+static NSString *const kStateKey      = @"insomnia.awake";
+static NSString *const kLidKey        = @"insomnia.lid";
+static NSString *const kThresholdKey  = @"insomnia.lid.minBattery";    // percent, default 20
+static NSString *const kGraceKey      = @"insomnia.lid.graceMinutes";  // minutes, 0 = never, default 120
+static NSString *const kUnpluggedKey  = @"insomnia.unpluggedAt";
+static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
 
 #pragma mark - Icons
 
@@ -22,21 +27,25 @@ static NSImage *AsleepIcon(void) {
     return Symbol(@"moon.fill", 15, NSFontWeightRegular);
 }
 
-/// Moon with a cross above it: sleep is blocked.
-static NSImage *AwakeIcon(void) {
+/// Moon with a cross above it: sleep is blocked. With `lid`, a dot marks a live lid override.
+static NSImage *AwakeIcon(BOOL lid) {
     NSImage *moon  = Symbol(@"moon.fill", 13, NSFontWeightRegular);
     NSImage *cross = Symbol(@"xmark", 7, NSFontWeightHeavy);
     NSImage *img = [NSImage imageWithSize:NSMakeSize(18, 18) flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        // Moon sits bottom-left, cross sits top-right above it.
+        // Moon sits bottom-left, cross sits top-right above it, dot bottom-right.
         [moon  drawInRect:NSMakeRect(0, 0, 13, 13)];
         [cross drawInRect:NSMakeRect(10.5, 10.5, 7, 7)];
+        if (lid) {
+            [NSColor.blackColor set];
+            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(13.5, 1, 4, 4)] fill];
+        }
         return YES;
     }];
     img.template = YES;
     return img;
 }
 
-#pragma mark - Shell helpers
+#pragma mark - Shell and power helpers
 
 /// Runs a program synchronously. Returns exit status; stdout in *out if given.
 static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
@@ -54,13 +63,48 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
     return t.terminationStatus;
 }
 
+/// Power source snapshot. percent is -1 when no battery is present (desktop).
+/// Test hook: `defaults write no.guerrilla.insomnia insomnia.debug.power battery:15` fakes a state.
+static void PowerState(BOOL *onAC, int *percent) {
+    NSString *fake = [NSUserDefaults.standardUserDefaults stringForKey:@"insomnia.debug.power"];
+    if (fake.length) {
+        NSArray *p = [fake componentsSeparatedByString:@":"];
+        *onAC = ![p[0] isEqualToString:@"battery"];
+        *percent = p.count > 1 ? [p[1] intValue] : 100;
+        return;
+    }
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    CFStringRef type = info ? IOPSGetProvidingPowerSourceType(info) : NULL;
+    *onAC = !type || CFStringCompare(type, CFSTR(kIOPSACPowerValue), 0) == kCFCompareEqualTo;
+    *percent = -1;
+    CFArrayRef list = info ? IOPSCopyPowerSourcesList(info) : NULL;
+    for (CFIndex i = 0; list && i < CFArrayGetCount(list); i++) {
+        NSDictionary *d = (__bridge NSDictionary *)IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(list, i));
+        if (![d[@(kIOPSTypeKey)] isEqual:@(kIOPSInternalBatteryType)]) continue;
+        double cur = [d[@(kIOPSCurrentCapacityKey)] doubleValue], max = [d[@(kIOPSMaxCapacityKey)] doubleValue];
+        if (max > 0) *percent = (int)(100.0 * cur / max + 0.5);
+    }
+    if (list) CFRelease(list);
+    if (info) CFRelease(info);
+}
+
+static NSString *FormatDuration(NSTimeInterval s) {
+    int m = (int)(s / 60);
+    return m < 60 ? [NSString stringWithFormat:@"%d min", m]
+                  : [NSString stringWithFormat:@"%d h %02d min", m / 60, m % 60];
+}
+
 #pragma mark - App
 
 @interface Insomnia : NSObject <NSApplicationDelegate>
 @property (strong) NSStatusItem *statusItem;
-@property (strong) NSImage *awakeIcon;
-@property (strong) NSImage *asleepIcon;
+@property (strong) NSImage *awakeIcon, *awakeLidIcon, *asleepIcon;
+@property (strong) NSTimer *guardTimer;
+@property BOOL lidLive;   // what pmset reported at the last sync
+- (void)syncLid;
 @end
+
+static void PowerChanged(void *ctx) { [(__bridge Insomnia *)ctx syncLid]; }
 
 @implementation Insomnia {
     IOPMAssertionID _assertions[2];
@@ -69,26 +113,41 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
 
 #pragma mark Preferences
 
-- (BOOL)isAwake {
-    id v = [NSUserDefaults.standardUserDefaults objectForKey:kStateKey];
-    return v ? [v boolValue] : YES;   // default: on
-}
-- (void)setAwake:(BOOL)awake { [NSUserDefaults.standardUserDefaults setBool:awake forKey:kStateKey]; }
+- (NSUserDefaults *)d { return NSUserDefaults.standardUserDefaults; }
 
-- (BOOL)lidPref { return [NSUserDefaults.standardUserDefaults boolForKey:kLidKey]; }   // default: off
-- (void)setLidPref:(BOOL)on { [NSUserDefaults.standardUserDefaults setBool:on forKey:kLidKey]; }
+- (BOOL)isAwake { id v = [self.d objectForKey:kStateKey]; return v ? [v boolValue] : YES; }   // default: on
+- (void)setAwake:(BOOL)awake { [self.d setBool:awake forKey:kStateKey]; }
+
+- (BOOL)lidPref { return [self.d boolForKey:kLidKey]; }   // default: off
+- (void)setLidPref:(BOOL)on { [self.d setBool:on forKey:kLidKey]; }
+
+- (int)minBattery { id v = [self.d objectForKey:kThresholdKey]; return v ? [v intValue] : 20; }
+- (int)graceMinutes { id v = [self.d objectForKey:kGraceKey]; return v ? [v intValue] : 120; }
+
+- (NSDate *)unpluggedAt { return [self.d objectForKey:kUnpluggedKey]; }
+- (void)setUnpluggedAt:(NSDate *)date {
+    if (date) [self.d setObject:date forKey:kUnpluggedKey]; else [self.d removeObjectForKey:kUnpluggedKey];
+}
 
 #pragma mark Lifecycle
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
-    self.awakeIcon  = AwakeIcon();
-    self.asleepIcon = AsleepIcon();
+    self.awakeIcon    = AwakeIcon(NO);
+    self.awakeLidIcon = AwakeIcon(YES);
+    self.asleepIcon   = AsleepIcon();
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
     NSStatusBarButton *button = self.statusItem.button;
     button.target = self;
     button.action = @selector(handleClick:);
     [button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
-    [self apply:self.isAwake];
+
+    // Power source changes (plug/unplug, capacity) plus a minute tick for the grace clock.
+    CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PowerChanged, (__bridge void *)self);
+    if (src) { CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode); CFRelease(src); }
+    self.guardTimer = [NSTimer scheduledTimerWithTimeInterval:60 target:self selector:@selector(syncLid) userInfo:nil repeats:YES];
+    self.guardTimer.tolerance = 10;
+
+    [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
@@ -127,6 +186,9 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
     else              [self enableLid:YES];
 }
 
+- (void)setMinBattery:(NSMenuItem *)item { [self.d setInteger:item.tag forKey:kThresholdKey]; [self syncLid]; }
+- (void)setGrace:(NSMenuItem *)item      { [self.d setInteger:item.tag forKey:kGraceKey];     [self syncLid]; }
+
 - (void)toggleLaunchAtLogin {
     SMAppService *svc = SMAppService.mainAppService;
     NSError *err = nil;
@@ -137,38 +199,54 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
 
 - (void)quit { [NSApp terminate:nil]; }
 
+static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BOOL on) {
+    NSMenuItem *i = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+    i.target = target;
+    i.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:i];
+    return i;
+}
+
 - (void)showMenu {
     BOOL awake = self.isAwake, lid = self.lidPref;
+    BOOL onAC; int pct; PowerState(&onAC, &pct);
     NSMenu *menu = [NSMenu new];
 
-    NSString *title = !awake ? @"Insomnia is off — Mac may sleep"
-                    : lid    ? @"Insomnia is on — awake even with lid closed"
-                             : @"Insomnia is on — Mac stays awake";
-    NSMenuItem *state = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
-    state.enabled = NO;
-    [menu addItem:state];
+    NSString *title;
+    if (!awake)                 title = @"Insomnia is off — Mac may sleep";
+    else if (!lid)              title = @"Insomnia is on — Mac stays awake";
+    else if (self.lidLive)      title = @"Insomnia is on — awake even with lid closed";
+    else                        title = [NSString stringWithFormat:@"Insomnia is on — lid override paused (%@)", [self pauseReason]];
+    Item(menu, title, NULL, nil, NO).enabled = NO;
     [menu addItem:NSMenuItem.separatorItem];
 
-    NSMenuItem *t = [[NSMenuItem alloc] initWithTitle:@"Prevent Sleep" action:@selector(toggle) keyEquivalent:@""];
-    t.state = awake ? NSControlStateValueOn : NSControlStateValueOff;
-    t.target = self;
-    [menu addItem:t];
+    Item(menu, @"Prevent Sleep", @selector(toggle), self, awake);
+    Item(menu, @"Keep Awake With Lid Closed", @selector(toggleLid), self, lid);
 
-    NSMenuItem *l = [[NSMenuItem alloc] initWithTitle:@"Keep Awake With Lid Closed" action:@selector(toggleLid) keyEquivalent:@""];
-    l.state = lid ? NSControlStateValueOn : NSControlStateValueOff;
-    l.target = self;
-    [menu addItem:l];
+    // On-battery guard submenu
+    NSMenu *sub = [NSMenu new];
+    NSString *status = onAC ? @"On charger"
+                            : [NSString stringWithFormat:@"Unplugged %@ · battery %d%%",
+                               FormatDuration(-[self.unpluggedAt timeIntervalSinceNow]), pct];
+    Item(sub, status, NULL, nil, NO).enabled = NO;
+    [sub addItem:NSMenuItem.separatorItem];
+    Item(sub, @"Pause lid override when battery is below…", NULL, nil, NO).enabled = NO;
+    for (NSNumber *n in @[@10, @20, @30, @40, @50])
+        Item(sub, [NSString stringWithFormat:@"%@%%", n], @selector(setMinBattery:), self, self.minBattery == n.intValue).tag = n.intValue;
+    [sub addItem:NSMenuItem.separatorItem];
+    Item(sub, @"…or when unplugged longer than", NULL, nil, NO).enabled = NO;
+    NSArray *graces = @[@[@30, @"30 min"], @[@60, @"1 hour"], @[@120, @"2 hours"], @[@240, @"4 hours"], @[@0, @"Never"]];
+    for (NSArray *g in graces)
+        Item(sub, g[1], @selector(setGrace:), self, self.graceMinutes == [g[0] intValue]).tag = [g[0] intValue];
+    NSMenuItem *subItem = [[NSMenuItem alloc] initWithTitle:@"Lid Override on Battery" action:nil keyEquivalent:@""];
+    subItem.submenu = sub;
+    [menu addItem:subItem];
 
     [menu addItem:NSMenuItem.separatorItem];
-    NSMenuItem *login = [[NSMenuItem alloc] initWithTitle:@"Launch at Login" action:@selector(toggleLaunchAtLogin) keyEquivalent:@""];
-    login.state = SMAppService.mainAppService.status == SMAppServiceStatusEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    login.target = self;
-    [menu addItem:login];
-
+    Item(menu, @"Launch at Login", @selector(toggleLaunchAtLogin), self,
+         SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
     [menu addItem:NSMenuItem.separatorItem];
-    NSMenuItem *q = [[NSMenuItem alloc] initWithTitle:@"Quit Insomnia" action:@selector(quit) keyEquivalent:@"q"];
-    q.target = self;
-    [menu addItem:q];
+    Item(menu, @"Quit Insomnia", @selector(quit), self, NO).keyEquivalent = @"q";
 
     self.statusItem.menu = menu;
     [self.statusItem.button performClick:nil];
@@ -181,9 +259,14 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
     self.awake = awake;
     if (awake) [self acquireAssertions]; else [self releaseAssertions];
     [self syncLid];
-    self.statusItem.button.image = awake ? self.awakeIcon : self.asleepIcon;
-    self.statusItem.button.toolTip = awake ? @"Insomnia: Mac stays awake (click to allow sleep)"
-                                           : @"Insomnia: Mac may sleep (click to keep awake)";
+}
+
+- (void)refreshIcon {
+    BOOL awake = self.isAwake;
+    self.statusItem.button.image = !awake ? self.asleepIcon : self.lidLive ? self.awakeLidIcon : self.awakeIcon;
+    self.statusItem.button.toolTip = !awake       ? @"Insomnia: Mac may sleep (click to keep awake)"
+                                   : self.lidLive ? @"Insomnia: awake even with lid closed (click to allow sleep)"
+                                                  : @"Insomnia: Mac stays awake (click to allow sleep)";
 }
 
 - (void)acquireAssertions {
@@ -205,10 +288,29 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
 
 #pragma mark Lid (pmset disablesleep, root-only)
 
-/// The lid override is active only while Insomnia is on AND the lid preference is on.
+/// Why the battery guard is holding the lid override off right now, or nil if it is not.
+- (NSString *)pauseReason {
+    BOOL onAC; int pct; PowerState(&onAC, &pct);
+    if (onAC) return nil;
+    if (pct >= 0 && pct <= self.minBattery) return [NSString stringWithFormat:@"battery %d%%", pct];
+    NSTimeInterval unplugged = -[self.unpluggedAt timeIntervalSinceNow];
+    if (self.graceMinutes > 0 && unplugged > self.graceMinutes * 60)
+        return [NSString stringWithFormat:@"unplugged %@", FormatDuration(unplugged)];
+    return nil;
+}
+
+/// The lid override is live only while Insomnia is on, the lid preference is on,
+/// and the battery guard is not holding it off. Also repairs a stale OS setting.
 - (void)syncLid {
-    BOOL want = self.isAwake && self.lidPref;
-    if (want != [self lidSleepDisabled]) [self setLidSleepDisabled:want];
+    BOOL onAC; int pct; PowerState(&onAC, &pct);
+    if (onAC) self.unpluggedAt = nil;
+    else if (!self.unpluggedAt) self.unpluggedAt = NSDate.date;
+
+    BOOL want = self.isAwake && self.lidPref && ![self pauseReason];
+    BOOL have = [self lidSleepDisabled];
+    if (want != have && [self setLidSleepDisabled:want]) have = want;
+    self.lidLive = have;
+    [self refreshIcon];
 }
 
 - (BOOL)lidSleepDisabled {
@@ -250,7 +352,8 @@ static int Run(NSString *path, NSArray<NSString *> *args, NSString **out) {
         NSAlert *a = [NSAlert new];
         a.messageText = @"Keep the Mac awake with the lid closed?";
         a.informativeText = @"It will keep running with the lid shut, also inside a bag, and can get warm.\n\n"
-                             "Insomnia turns this off again when you switch it off or quit. "
+                             "On battery, Insomnia pauses this when the battery gets low or the charger has been "
+                             "out for a while (adjustable). It also turns it off when you switch Insomnia off or quit. "
                              "The first time, macOS asks for your password to allow the change.";
         [a addButtonWithTitle:@"Keep Awake"];
         [a addButtonWithTitle:@"Cancel"];
