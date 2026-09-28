@@ -1,0 +1,26 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        run: sh build.sh --no-install
+      - name: Zip
+        run: cd build && ditto -c -k --keepParent Insomnia.app Insomnia.app.zip
+      - name: Smoke test
+        run: |
+          lipo -archs build/Insomnia.app/Contents/MacOS/Insomnia
+          defaults read "$PWD/build/Insomnia.app/Contents/Info.plist" CFBundleShortVersionString
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "Insomnia ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" build/Insomnia.app.zip --clobber
