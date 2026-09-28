@@ -7,6 +7,6 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sh build.sh --no-install
       - run: sh -n install.sh && sh -n uninstall.sh
