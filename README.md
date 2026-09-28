@@ -11,6 +11,13 @@ A tiny macOS menu bar app that keeps your laptop awake. One click to toggle.
 - **Right-click** (or ctrl-click): menu with *Prevent Sleep*, *Launch at Login*, *Quit*.
 - The display may still dim and turn off. That is intended: it saves battery while the system, network and your terminal sessions keep running.
 - State is remembered across restarts. Default on first launch is **on**.
+- **Scriptable** from any shell, no Accessibility permission needed:
+
+```
+open insomnia://on
+open insomnia://off
+open insomnia://toggle
+```
 
 Under the hood it holds the same two IOKit power assertions as `caffeinate -i -s`:
 `PreventUserIdleSystemSleep` always, and `PreventSystemSleep` (effective on AC only). Verify with:

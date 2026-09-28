@@ -12,6 +12,13 @@
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>no.guerrilla.insomnia</string>
+      <key>CFBundleURLSchemes</key><array><string>insomnia</string></array>
+    </dict>
+  </array>
   <key>NSHumanReadableCopyright</key><string>Frikk Jarl</string>
 </dict>
 </plist>

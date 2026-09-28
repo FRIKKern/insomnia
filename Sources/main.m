@@ -71,6 +71,16 @@ static NSImage *AwakeIcon(void) {
     [self releaseAssertions];
 }
 
+/// Scriptable: open insomnia://on, insomnia://off, insomnia://toggle
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
+    for (NSURL *u in urls) {
+        NSString *cmd = u.host.lowercaseString ?: @"";
+        if ([cmd isEqualToString:@"on"])          [self apply:YES];
+        else if ([cmd isEqualToString:@"off"])    [self apply:NO];
+        else if ([cmd isEqualToString:@"toggle"]) [self apply:!self.isAwake];
+    }
+}
+
 #pragma mark Clicks
 
 - (void)handleClick:(id)sender {
