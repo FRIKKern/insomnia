@@ -22,6 +22,9 @@ static NSString *const kOfflineAtKey  = @"insomnia.offlineAt";
 static NSString *const kSudoers       = @"/etc/sudoers.d/insomnia";
 static NSString *const kAutoUpdateKey = @"insomnia.autoUpdateCheck";   // default YES
 static NSString *const kUpdateAtKey   = @"insomnia.updateCheckedAt";
+static NSString *const kAgentsKey     = @"insomnia.agents";            // Awake While Agents Work, default NO
+static NSString *const kQuietKey      = @"insomnia.agents.quietMinutes"; // minutes all agents must be idle, default 10
+static NSString *const kWorkingAtKey  = @"insomnia.agents.workingAt";   // last time any agent was seen working
 static NSString *const kRepo          = @"FRIKKern/insomnia";
 
 #pragma mark - Icons
@@ -142,6 +145,46 @@ static BOOL Online(void) {
     return ok && (f & kSCNetworkReachabilityFlagsReachable) && !(f & kSCNetworkReachabilityFlagsConnectionRequired);
 }
 
+/// First minmacs binary that exists: ~/.local/bin, Homebrew, then PATH. nil when not installed.
+static NSString *MinMacsPath(void) {
+    NSMutableArray *dirs = [NSMutableArray arrayWithObjects:
+        [NSHomeDirectory() stringByAppendingPathComponent:@".local/bin"], @"/opt/homebrew/bin", nil];
+    [dirs addObjectsFromArray:[NSProcessInfo.processInfo.environment[@"PATH"] componentsSeparatedByString:@":"]];
+    [dirs addObject:@"/usr/local/bin"];   // Intel Homebrew; a Finder-launched app has no /usr/local on PATH
+    for (NSString *dir in dirs) {
+        if (!dir.length) continue;
+        NSString *p = [dir stringByAppendingPathComponent:@"minmacs"];
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:p]) return p;
+    }
+    return nil;
+}
+
+/// Agent sessions working right now, as reported by `minmacs agents --json`.
+/// Detection is MinMacs' job. A missing binary, non-zero exit, timeout or bad JSON all read as 0.
+/// Blocks for up to ~10 s: call off the main thread. Test hook: `insomnia.debug.agents` = <integer> replaces the call.
+static int MinMacsWorking(void) {
+    NSString *bin = MinMacsPath();
+    if (!bin) return 0;
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:bin];
+    t.arguments = @[@"agents", @"--json"];
+    NSPipe *p = [NSPipe pipe];
+    t.standardOutput = p;
+    t.standardError = [NSPipe pipe];
+    t.standardInput = [NSFileHandle fileHandleWithNullDevice];
+    if (![t launchAndReturnError:nil]) return 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (t.isRunning) [t terminate];
+    });
+    NSData *d = [p.fileHandleForReading readDataToEndOfFile];
+    [t waitUntilExit];
+    if (t.terminationStatus != 0 || !d.length) return 0;
+    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    if (![j isKindOfClass:NSDictionary.class]) return 0;
+    id w = j[@"working"];
+    return [w isKindOfClass:NSNumber.class] ? MAX(0, [w intValue]) : 0;
+}
+
 #pragma mark - App
 
 @interface Insomnia : NSObject <NSApplicationDelegate>
@@ -153,6 +196,10 @@ static BOOL Online(void) {
 @property SCNetworkReachabilityRef reach;
 @property (strong) NSString *availableVersion;   // newer release seen by the last check, or nil
 @property BOOL screenDarkened;                    // we put the display to sleep for this lid-closed stretch
+@property (strong) NSTimer *agentTimer;           // 15 s MinMacs poll, alive only while Awake While Agents Work is on
+@property int agentWorking;                       // working sessions at the last poll
+@property BOOL agentHold;                         // agent mode is holding the assertions (manual state is off)
+@property BOOL agentPolling;                      // a minmacs call is in flight
 - (void)syncLid;
 @end
 
@@ -193,6 +240,15 @@ static void RootDomainMessage(void *ctx, io_service_t s, natural_t type, void *a
     if (date) [self.d setObject:date forKey:kOfflineAtKey]; else [self.d removeObjectForKey:kOfflineAtKey];
 }
 
+- (BOOL)agentsMode { return [self.d boolForKey:kAgentsKey]; }   // default: off
+- (int)quietMinutes { int v = (int)[self.d integerForKey:kQuietKey]; return v > 0 ? v : 10; }
+- (NSDate *)workingAt { return [self.d objectForKey:kWorkingAtKey]; }
+- (void)setWorkingAt:(NSDate *)date {
+    if (date) [self.d setObject:date forKey:kWorkingAtKey]; else [self.d removeObjectForKey:kWorkingAtKey];
+}
+/// Assertions are wanted when the user switched Insomnia on, or agent mode says so. Manual on always wins.
+- (BOOL)holding { return self.isAwake || self.agentHold; }
+
 - (NSDate *)unpluggedAt { return [self.d objectForKey:kUnpluggedKey]; }
 - (void)setUnpluggedAt:(NSDate *)date {
     if (date) [self.d setObject:date forKey:kUnpluggedKey]; else [self.d removeObjectForKey:kUnpluggedKey];
@@ -232,6 +288,7 @@ static void RootDomainMessage(void *ctx, io_service_t s, natural_t type, void *a
     if (rd) IOObjectRelease(rd);
 
     [self apply:self.isAwake];   // also self-heals a stale lid override left by an unclean exit
+    if (self.agentsMode) [self startAgentWatch];
     [self performSelector:@selector(dailyUpdateCheck) withObject:nil afterDelay:20];
 }
 
@@ -241,13 +298,15 @@ static void RootDomainMessage(void *ctx, io_service_t s, natural_t type, void *a
     if ([self lidSleepDisabled]) [self setLidSleepDisabled:NO];
 }
 
-/// Scriptable: open insomnia://on|off|toggle|lid-on|lid-off|login-on|login-off|quit
+/// Scriptable: open insomnia://on|off|toggle|agents-on|agents-off|lid-on|lid-off|login-on|login-off|update|quit
 - (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
     for (NSURL *u in urls) {
         NSString *cmd = u.host.lowercaseString ?: @"";
         if      ([cmd isEqualToString:@"on"])      [self apply:YES];
         else if ([cmd isEqualToString:@"off"])     [self apply:NO];
         else if ([cmd isEqualToString:@"toggle"])  [self apply:!self.isAwake];
+        else if ([cmd isEqualToString:@"agents-on"])  [self setAgentsMode:YES];
+        else if ([cmd isEqualToString:@"agents-off"]) [self setAgentsMode:NO];
         else if ([cmd isEqualToString:@"lid-on"])  [self enableLid:NO];
         else if ([cmd isEqualToString:@"lid-off"]) { self.lidPref = NO; [self syncLid]; }
         else if ([cmd isEqualToString:@"login-on"] || [cmd isEqualToString:@"login-off"]) {
@@ -299,21 +358,44 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
 }
 
 - (void)showMenu {
-    BOOL awake = self.isAwake, lid = self.lidPref;
+    BOOL awake = self.isAwake, lid = self.lidPref, agents = self.agentsMode;
     BOOL onAC; int pct; PowerState(&onAC, &pct);
     NSMenu *menu = [NSMenu new];
 
     NSString *title;
-    if (!awake)                 title = @"Insomnia is off — Mac may sleep";
+    if (agents && !awake) {
+        // Agent mode decides: the header says what it sees and what it does about it.
+        title = [self agentsLine];
+        if (self.agentHold && lid && !self.lidLive)
+            title = [title stringByAppendingFormat:@" · lid override paused (%@)", [self pauseReason] ?: @"waiting"];
+    }
+    else if (!awake)            title = @"Insomnia is off — Mac may sleep";
     else if (!lid)              title = @"Insomnia is on — Mac stays awake";
     else if (self.lidLive)      title = @"Insomnia is on — awake even with lid closed";
     else                        title = [NSString stringWithFormat:@"Insomnia is on — lid override paused (%@)", [self pauseReason]];
     Item(menu, title, NULL, nil, NO).enabled = NO;
+    if (agents && awake) Item(menu, [[self agentsLine] stringByAppendingString:@" · manual on wins"], NULL, nil, NO).enabled = NO;
     [menu addItem:NSMenuItem.separatorItem];
 
     Item(menu, @"Prevent Sleep", @selector(toggle), self, awake);
     Item(menu, @"Keep Awake With Lid Closed", @selector(toggleLid), self, lid);
     Item(menu, @"Screen Off While Lid Closed", @selector(toggleScreenOff), self, self.screenOff).enabled = lid;
+
+    // Awake While Agents Work: submenu with the switch and the quiet period.
+    NSMenu *ag = [NSMenu new];
+    if (MinMacsPath() || [self.d objectForKey:@"insomnia.debug.agents"]) {
+        Item(ag, @"Enabled", @selector(toggleAgents), self, agents);
+        [ag addItem:NSMenuItem.separatorItem];
+        Item(ag, @"Release when all agents have been idle for…", NULL, nil, NO).enabled = NO;
+        for (NSNumber *n in @[@5, @10, @20, @30])
+            Item(ag, [NSString stringWithFormat:@"%@ minutes", n], @selector(setQuiet:), self, self.quietMinutes == n.intValue).tag = n.intValue;
+    } else {
+        Item(ag, @"Needs MinMacs: brew install frikkern/tap/minmacs", NULL, nil, NO).enabled = NO;
+    }
+    NSMenuItem *agItem = [[NSMenuItem alloc] initWithTitle:@"Awake While Agents Work" action:nil keyEquivalent:@""];
+    agItem.submenu = ag;
+    agItem.state = agents ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:agItem];
 
     // On-battery guard submenu
     NSMenu *sub = [NSMenu new];
@@ -366,18 +448,92 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
 
 #pragma mark Power assertions
 
+/// The manual switch. Agent mode only acts while it is off.
 - (void)apply:(BOOL)awake {
     self.awake = awake;
-    if (awake) [self acquireAssertions]; else [self releaseAssertions];
+    [self reconcile];
+}
+
+/// One place that turns manual state + agent state into assertions and the lid override.
+- (void)reconcile {
+    [self evaluateAgents];
+    if (self.holding) [self acquireAssertions]; else [self releaseAssertions];
     [self syncLid];
 }
 
 - (void)refreshIcon {
-    BOOL awake = self.isAwake;
+    BOOL awake = self.holding;
+    BOOL byAgents = !self.isAwake && self.agentHold;
     self.statusItem.button.image = !awake ? self.asleepIcon : self.lidLive ? self.awakeLidIcon : self.awakeIcon;
     self.statusItem.button.toolTip = !awake       ? @"Insomnia: Mac may sleep (click to keep awake)"
                                    : self.lidLive ? @"Insomnia: awake even with lid closed (click to allow sleep)"
+                                   : byAgents     ? @"Insomnia: awake while agents work (click to keep awake regardless)"
                                                   : @"Insomnia: Mac stays awake (click to allow sleep)";
+}
+
+#pragma mark Agents (Awake While Agents Work)
+
+/// Hold while any agent is working, and until all have been idle for the quiet period.
+/// Pure function of the stored count and timestamp; returns whether the hold changed.
+- (BOOL)evaluateAgents {
+    BOOL was = self.agentHold;
+    BOOL hold = NO;
+    if (self.agentsMode && !self.isAwake) {
+        NSTimeInterval idle = self.workingAt ? -[self.workingAt timeIntervalSinceNow] : INFINITY;
+        hold = self.agentWorking > 0 || idle < self.quietMinutes * 60;
+    }
+    self.agentHold = hold;
+    return hold != was;
+}
+
+- (void)setAgentsMode:(BOOL)on {
+    [self.d setBool:on forKey:kAgentsKey];
+    if (on) { [self startAgentWatch]; return; }
+    [self.agentTimer invalidate]; self.agentTimer = nil;
+    self.agentWorking = 0;
+    self.workingAt = nil;
+    [self reconcile];
+}
+
+- (void)toggleAgents { [self setAgentsMode:!self.agentsMode]; }
+- (void)setQuiet:(NSMenuItem *)item { [self.d setInteger:item.tag forKey:kQuietKey]; [self reconcile]; }
+
+/// Poll now, then every 15 s.
+- (void)startAgentWatch {
+    [self.agentTimer invalidate];
+    self.agentTimer = [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(pollAgents) userInfo:nil repeats:YES];
+    self.agentTimer.tolerance = 3;
+    [self pollAgents];
+}
+
+/// The minmacs call runs off the main thread; the result lands in agentsPolled:. The debug hook answers inline.
+- (void)pollAgents {
+    if (!self.agentsMode) return;
+    id hook = [self.d objectForKey:@"insomnia.debug.agents"];
+    if (hook) { [self agentsPolled:MAX(0, [hook intValue])]; return; }
+    if (self.agentPolling) return;
+    self.agentPolling = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int n = MinMacsWorking();
+        dispatch_async(dispatch_get_main_queue(), ^{ self.agentPolling = NO; [self agentsPolled:n]; });
+    });
+}
+
+- (void)agentsPolled:(int)working {
+    if (!self.agentsMode) return;   // switched off while the call was in flight
+    self.agentWorking = working;
+    if (working > 0) self.workingAt = NSDate.date;
+    if ([self evaluateAgents]) [self reconcile];
+}
+
+/// The menu header line while the mode is on.
+- (NSString *)agentsLine {
+    if (!MinMacsPath() && ![self.d objectForKey:@"insomnia.debug.agents"]) return @"Agents: MinMacs not found · Mac may sleep";
+    if (self.agentWorking > 0) return [NSString stringWithFormat:@"Agents: %d working · awake", self.agentWorking];
+    if (!self.workingAt) return @"Agents idle · Mac may sleep";
+    int m = (int)(-[self.workingAt timeIntervalSinceNow] / 60);
+    return m < self.quietMinutes ? [NSString stringWithFormat:@"Agents idle %d min · releasing at %d", m, self.quietMinutes]
+                                 : [NSString stringWithFormat:@"Agents idle %d min · Mac may sleep", m];
 }
 
 - (void)acquireAssertions {
@@ -487,7 +643,7 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     return nil;
 }
 
-/// The lid override is live only while Insomnia is on, the lid preference is on,
+/// The lid override is live only while Insomnia is holding (switched on, or agents working), the lid preference is on,
 /// and the battery guard is not holding it off. Also repairs a stale OS setting.
 - (void)syncLid {
     BOOL onAC; int pct; PowerState(&onAC, &pct);
@@ -502,7 +658,7 @@ static NSMenuItem *Item(NSMenu *menu, NSString *title, SEL action, id target, BO
     if (onAC || !closed || !self.thermalGuard) self.thermalHold = NO;
     else if (Thermal() >= NSProcessInfoThermalStateSerious) self.thermalHold = YES;
 
-    BOOL want = self.isAwake && self.lidPref && ![self pauseReason];
+    BOOL want = self.holding && self.lidPref && ![self pauseReason];
     BOOL have = [self lidSleepDisabled];
     if (want != have && [self setLidSleepDisabled:want]) have = want;
     self.lidLive = have;

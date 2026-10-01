@@ -2,6 +2,16 @@
 
 All notable changes to Insomnia. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0] - 2026-10-01
+
+### Added
+- *Awake While Agents Work* (default off, remembered): Insomnia holds its assertions whenever any agent session on the Mac is working, and releases them once every session has been idle for a quiet period (5, 10, 20 or 30 minutes; default 10). Agent state comes from `minmacs agents --json`, polled every 15 s while the mode is on; a missing binary, non-zero exit or bad JSON counts as no agents. Without MinMacs the submenu shows *Needs MinMacs: brew install frikkern/tap/minmacs*.
+- The manual toggle still wins: agent mode only acts while Insomnia is switched off. The lid setting and all four guards keep applying whenever assertions are held.
+- Menu header shows the state while the mode is on, for example "Agents: 2 working · awake" or "Agents idle 4 min · releasing at 10".
+- `insomnia://agents-on` and `insomnia://agents-off`.
+- Debug hook `insomnia.debug.agents` = *integer* replaces the minmacs call.
+- `./test.sh`: agent mode checks (hold, quiet-period release, manual wins, mode off, lid override and guards under an agent hold).
+
 ## [1.2.0] - 2026-09-28
 
 ### Added

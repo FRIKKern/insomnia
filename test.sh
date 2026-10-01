@@ -18,17 +18,50 @@ check() { # name expected actual
 pgrep -x Insomnia >/dev/null || { echo "Insomnia is not running"; exit 1; }
 orig_awake=$(defaults read $D insomnia.awake 2>/dev/null || echo 1)
 orig_lid=$(defaults read $D insomnia.lid 2>/dev/null || echo 0)
+orig_agents=$(defaults read $D insomnia.agents 2>/dev/null || echo 0)
 cleanup() {
-  for k in power lid thermal net; do defaults delete $D insomnia.debug.$k >/dev/null 2>&1; done
-  for k in lid.minBattery lid.graceMinutes lid.offlineMinutes lid.thermalGuard lid.screenOff unpluggedAt offlineAt; do defaults delete $D insomnia.$k >/dev/null 2>&1; done
+  for k in power lid thermal net agents; do defaults delete $D insomnia.debug.$k >/dev/null 2>&1; done
+  for k in lid.minBattery lid.graceMinutes lid.offlineMinutes lid.thermalGuard lid.screenOff unpluggedAt offlineAt agents.quietMinutes agents.workingAt; do defaults delete $D insomnia.$k >/dev/null 2>&1; done
   [ "$orig_lid" = "1" ] && defaults write $D insomnia.lid -bool true || defaults write $D insomnia.lid -bool false
+  [ "$orig_agents" = "1" ] && open insomnia://agents-on || open insomnia://agents-off
+  sleep 1
   [ "$orig_awake" = "1" ] && open insomnia://on || open insomnia://off
 }
 trap cleanup EXIT
 
+open insomnia://agents-off; sleep 1   # a real agent mode would hold the assertions under the toggle checks
 echo "== toggle"
 open insomnia://off; sleep 1.5; check "off releases assertions" 0 "$(asrt)"
 open insomnia://on;  sleep 1.5; check "on holds two assertions"  2 "$(asrt)"
+
+# Awake While Agents Work. The debug hook stands in for minmacs, so no real session is read.
+agents() { open "insomnia://agents-${1}"; sleep 1.5; }   # agents-on also polls right away
+echo "== awake while agents work"
+defaults write $D insomnia.debug.agents -int 1
+open insomnia://off; sleep 1.5
+agents on;                                           check "mode on, 1 working, manual off: holds" 2 "$(asrt)"
+defaults write $D insomnia.debug.agents -int 0
+defaults write $D insomnia.agents.workingAt -date "$(ago 5)"; agents on
+                                                     check "0 working, idle 5 min (quiet 10): still holds" 2 "$(asrt)"
+defaults write $D insomnia.agents.workingAt -date "$(ago 11)"; agents on
+                                                     check "0 working, idle 11 min (quiet 10): releases" 0 "$(asrt)"
+defaults write $D insomnia.agents.quietMinutes -int 20; agents on
+                                                     check "quiet period 20: idle 11 min holds again" 2 "$(asrt)"
+defaults delete $D insomnia.agents.quietMinutes
+defaults write $D insomnia.agents.workingAt -date "$(ago 11)"; agents on
+                                                     check "back to default 10 min: releases" 0 "$(asrt)"
+defaults write $D insomnia.debug.agents -int 3; agents on
+                                                     check "agents start working again: holds" 2 "$(asrt)"
+defaults write $D insomnia.debug.agents -int 0
+defaults write $D insomnia.agents.workingAt -date "$(ago 11)"; open insomnia://on; sleep 1.5; agents on
+                                                     check "manual on wins over agents idle" 2 "$(asrt)"
+open insomnia://off; sleep 1.5;                      check "manual off, agents idle: releases" 0 "$(asrt)"
+defaults write $D insomnia.debug.agents -int 1; agents on; open insomnia://on; sleep 1.5; open insomnia://off; sleep 1.5
+                                                     check "manual off while agents work: agent mode holds" 2 "$(asrt)"
+agents off;                                          check "mode off, agent still working: releases" 0 "$(asrt)"
+check "mode off clears the working clock" none "$(defaults read $D insomnia.agents.workingAt 2>/dev/null || echo none)"
+open insomnia://on; sleep 1.5; agents off;           check "mode off leaves manual on alone" 2 "$(asrt)"
+open insomnia://off; sleep 1.5;                      check "mode off, manual off: as before" 0 "$(asrt)"
 
 if sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
   defaults write $D insomnia.lid -bool true
@@ -58,6 +91,19 @@ if sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
   dbg power=ac;                                        check "AC clears hold" live "$(lid)"
   dbg power=battery:70 lid=closed thermal=serious; defaults write $D insomnia.lid.thermalGuard -bool false; sync
                                                        check "thermal guard disabled" live "$(lid)"
+  echo "== agent hold and the lid override"
+  dbg power=ac lid=open thermal=nominal net=online
+  defaults write $D insomnia.debug.agents -int 2; open insomnia://off; sleep 1.5; agents on
+                                                       check "agents working: lid override live" live "$(lid)"
+  defaults write $D insomnia.debug.agents -int 0
+  defaults write $D insomnia.agents.workingAt -date "$(ago 11)"; agents on
+                                                       check "agents idle past quiet: override cleared" paused "$(lid)"
+  defaults write $D insomnia.debug.agents -int 2; agents on
+  defaults write $D insomnia.debug.power battery:10; open insomnia://lid-on; sleep 1.5
+                                                       check "guards still apply to agent hold (battery 10%)" paused "$(lid)"
+  defaults write $D insomnia.debug.power ac; open insomnia://lid-on; sleep 1.5
+                                                       check "charger back, agents still working: override live" live "$(lid)"
+  agents off
   echo "== screen off while lid closed (screen goes dark for a few seconds)"
   offs() { pmset -g log | grep -cE "Display is turned off"; }
   dbg power=ac lid=open thermal=nominal net=online; caffeinate -u -t 2; sleep 2   # wake display first

@@ -56,7 +56,7 @@ Removes the app, preferences, login item, and the optional sudo rule. Restores n
 ## Use
 
 - **Left-click** the moon: toggle.
-- **Right-click** (or ctrl-click): menu with *Prevent Sleep*, *Keep Awake With Lid Closed*, *Screen Off While Lid Closed*, *Lid Override on Battery*, *Launch at Login*, *Quit*.
+- **Right-click** (or ctrl-click): menu with *Prevent Sleep*, *Keep Awake With Lid Closed*, *Screen Off While Lid Closed*, *Awake While Agents Work*, *Lid Override on Battery*, *Launch at Login*, *Quit*.
 - The display may still dim and turn off. That is intended: it saves battery while the system, network and your terminal sessions keep running.
 - State is remembered across restarts. Default on first launch is **on**.
 
@@ -68,6 +68,8 @@ Any shell, script or agent can drive Insomnia through a URL scheme. No Accessibi
 open insomnia://on
 open insomnia://off
 open insomnia://toggle
+open insomnia://agents-on     # Awake While Agents Work (needs MinMacs)
+open insomnia://agents-off
 open insomnia://lid-on        # enable Keep Awake With Lid Closed, no confirmation dialog
 open insomnia://lid-off
 open insomnia://login-on      # register Launch at Login
@@ -96,6 +98,18 @@ pmset -g assertions | grep -q "Insomnia keeps" && echo OK
 ```
 
 The lid override (`INSOMNIA_LID=1` or `open insomnia://lid-on`) triggers a macOS admin password dialog on the user's screen the first time. Tell the user before triggering it. Everything else is silent. Bundle id `no.guerrilla.insomnia`, preferences readable with `defaults read no.guerrilla.insomnia`.
+
+## Awake While Agents Work
+
+For people who leave coding agents running: turn this on, switch Insomnia itself off, and the Mac stays awake exactly as long as an agent is working. *Awake While Agents Work* (default off, remembered) holds the same two assertions whenever any agent session on the Mac is working, and releases them once every session has been idle for a quiet period: 5, 10, 20 or 30 minutes in the item's submenu, default 10.
+
+- **Manual wins.** The moon toggle (left click, `insomnia://on|off`) is the user's say. Agent mode only acts while it is **off**, so the two never fight. Insomnia starts switched on on first launch, so click the moon off once to hand control to the agents.
+- **State comes from [MinMacs](https://github.com/FRIKKern/minmacs).** Every 15 seconds while the mode is on, Insomnia runs `minmacs agents --json` (looked up in `~/.local/bin`, `/opt/homebrew/bin`, then `PATH`) and reads `working`. A missing binary, a non-zero exit or bad JSON counts as no agents. Insomnia does no detection of its own. Without MinMacs the submenu shows one disabled line: *Needs MinMacs: brew install frikkern/tap/minmacs*.
+- **The header says what it sees:** "Agents: 2 working · awake", or "Agents idle 4 min · releasing at 10".
+- **Lid and guards are unchanged.** Whenever assertions are held, whether by the toggle or by agents, the lid setting and all four battery guards apply as before. When agents go quiet the assertions and the lid override are released together.
+- Turning the mode off forgets the idle clock and returns to plain manual behaviour.
+
+Test hook: `defaults write no.guerrilla.insomnia insomnia.debug.agents 2` replaces the minmacs call with a working count (`delete` to go back to the real reading). `insomnia.agents.workingAt` holds the time an agent was last seen working and `insomnia.agents.quietMinutes` the quiet period.
 
 ## Lid closed
 
